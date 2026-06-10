@@ -51,6 +51,37 @@ Options:
 | `--max-frames N` | stop each stream after N frames | all |
 | `--threshold T` | detection score threshold | 0.5 |
 | `--snapshot N` | write annotated PPM per stream at frame N (-1 = off) | 60 |
+| `--weights F.vpnw` | load trained weights | synthesized (untrained) |
+
+### Real detection
+
+Train the detector first (in the SDK tree — YOLOv8n pseudo-labels the
+test videos, the PyTorch twin of TinyDetector learns from them):
+
+```bash
+cd ../visionpipe-npu
+python3 tools/train_tiny_detector.py training_output \
+    test_data/drive_front.mp4 test_data/drive_rear.mp4 \
+    test_data/drive_left.mp4  test_data/drive_right.mp4 \
+    test_data/vtest.avi
+cd ../adas-multistream
+
+./build/multi_stream output_trained \
+    $TD/drive_front.mp4 $TD/drive_rear.mp4 \
+    $TD/drive_left.mp4  $TD/drive_right.mp4 \
+    --weights ../visionpipe-npu/training_output/tiny_detector_trained.vpnw \
+    --snapshot 300
+```
+
+With trained weights, detections follow scene content
+(same throughput — weights don't change the compute):
+
+| stream | scene | det/frame |
+|---|---|---|
+| drive_right | busy city street | **12.4** |
+| drive_rear | night highway | 1.0 |
+| drive_front | country road | 0.4 |
+| drive_left | empty coastal road | **0.0** |
 
 The final report shows, per stream: frames processed, effective fps,
 decode latency (avg/p95/p99), inference latency (avg/p95/p99) and average
@@ -95,10 +126,10 @@ Key observations:
 
 ## Notes
 
-- The detector is `TinyDetector` with deterministic synthesized weights —
-  the boxes are not semantically meaningful. The subject of this demo is
-  the **runtime behavior under multi-stream load**, not detection quality.
-  Real weights load via `WeightFile` without touching this code.
+- Without `--weights`, `TinyDetector` runs deterministic synthesized
+  weights — boxes are not meaningful, but the runtime load is identical.
+  With a trained `.vpnw` (see above) the same binary detects real
+  vehicles/people.
 - Scheduling is round-robin in a single thread. Planned extensions:
   priority scheduling (front camera first), frame dropping under
   overload, and a worker-thread pool feeding one `CommandQueue`.

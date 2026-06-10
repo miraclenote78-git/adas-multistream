@@ -22,11 +22,13 @@
 //       [--threshold T]      detection score threshold (default 0.5)
 //       [--snapshot N]       write one annotated PPM per stream at frame N
 //                            (default 60; pass -1 to disable)
+//       [--weights F.vpnw]   load trained weights (default: synthesized)
 
 #include "stream_stats.hpp"
 
 #include "visionpipe/model/detection.hpp"
 #include "visionpipe/model/tiny_detector.hpp"
+#include "visionpipe/model/weight_file.hpp"
 #include "visionpipe/runtime/allocator.hpp"
 #include "visionpipe/runtime/tensor.hpp"
 #include "visionpipe/vision/draw.hpp"
@@ -134,6 +136,7 @@ int main(int argc, char* argv[]) {
 
     const std::string out_dir = argv[1];
     std::vector<std::string> videos;
+    std::string  weights_path;
     std::int64_t max_frames     = -1;
     float        threshold      = 0.5f;
     std::int64_t snapshot_frame = 60;
@@ -143,6 +146,7 @@ int main(int argc, char* argv[]) {
         if (a == "--max-frames" && i + 1 < argc)    max_frames = std::atoll(argv[++i]);
         else if (a == "--threshold" && i + 1 < argc) threshold = static_cast<float>(std::atof(argv[++i]));
         else if (a == "--snapshot" && i + 1 < argc)  snapshot_frame = std::atoll(argv[++i]);
+        else if (a == "--weights" && i + 1 < argc)   weights_path = argv[++i];
         else videos.push_back(a);
     }
     if (videos.empty()) {
@@ -153,8 +157,16 @@ int main(int argc, char* argv[]) {
 
     // --- The "one NPU": a single shared detector ---
     runtime::ArenaAllocator weights(1 * 1024 * 1024);
-    model::TinyDetector detector(weights, /*batch=*/1);
-    const std::size_t scratch_bytes = detector.recommended_scratch_bytes();
+    std::unique_ptr<model::TinyDetector> detector;
+    if (weights_path.empty()) {
+        std::printf("weights: synthesized (untrained — boxes are not meaningful)\n");
+        detector = std::make_unique<model::TinyDetector>(weights, /*batch=*/1);
+    } else {
+        std::printf("weights: %s\n", weights_path.c_str());
+        model::WeightFile wf(weights_path);
+        detector = std::make_unique<model::TinyDetector>(wf, weights, /*batch=*/1);
+    }
+    const std::size_t scratch_bytes = detector->recommended_scratch_bytes();
 
     // --- One context per virtual camera ---
     std::vector<std::unique_ptr<StreamCtx>> streams;
@@ -188,7 +200,7 @@ int main(int argc, char* argv[]) {
                                     s.small_rgb.data(), kInW, kInH, kInW * 3);
             vision::rgb24_to_nchw_fp32(s.small_rgb.data(), kInW, kInH, kInW * 3,
                                        s.input);
-            detector.forward(s.input, s.scratch, s.output);
+            detector->forward(s.input, s.scratch, s.output);
             auto dets = model::decode_tiny_detector_output(s.output, /*batch_index=*/0,
                                                            kInW, kInH, threshold);
             dets = model::nms(std::move(dets), /*iou_threshold=*/0.45f);
