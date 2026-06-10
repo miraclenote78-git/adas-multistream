@@ -60,13 +60,19 @@ constexpr int kInW = static_cast<int>(model::TinyDetector::kInW);
 constexpr int kInH = static_cast<int>(model::TinyDetector::kInH);
 constexpr int kGW  = static_cast<int>(model::TinyDetector::kGridW);
 constexpr int kGH  = static_cast<int>(model::TinyDetector::kGridH);
-constexpr int kCh  = static_cast<int>(model::TinyDetector::kHeadCh);
+
+// Must match the training-side CLASS_NAMES in
+// visionpipe-npu/tools/train_tiny_detector.py.
+const std::vector<std::string> kClassNames = {
+    "person", "bicycle", "car", "motorcycle", "bus", "truck",
+};
 
 // Everything one camera stream owns. The arenas are deliberately
 // per-stream: on a real SoC this is the partitioning that stops one
 // camera's traffic from fragmenting another's memory.
 struct StreamCtx {
-    explicit StreamCtx(const std::string& path, std::size_t scratch_bytes)
+    StreamCtx(const std::string& path, std::size_t scratch_bytes,
+              std::int64_t head_ch)
         : source(path, vision::VideoFileOptions{vision::PixelFormat::kRgb24, /*loop=*/false}),
           io_arena(1 * 1024 * 1024),
           scratch(scratch_bytes),
@@ -77,9 +83,9 @@ struct StreamCtx {
             alignof(std::max_align_t));
         input = runtime::make_tensor(in_buf, {1, 3, kInH, kInW}, runtime::DType::kFloat32);
         auto* out_buf = io_arena.allocate(
-            static_cast<std::size_t>(kCh * kGH * kGW) * sizeof(float),
+            static_cast<std::size_t>(head_ch * kGH * kGW) * sizeof(float),
             alignof(std::max_align_t));
-        output = runtime::make_tensor(out_buf, {1, kCh, kGH, kGW}, runtime::DType::kFloat32);
+        output = runtime::make_tensor(out_buf, {1, head_ch, kGH, kGW}, runtime::DType::kFloat32);
     }
 
     vision::VideoFileSource    source;
@@ -168,10 +174,16 @@ int main(int argc, char* argv[]) {
     }
     const std::size_t scratch_bytes = detector->recommended_scratch_bytes();
 
+    if (detector->num_classes() > 0) {
+        std::printf("classes: %lld\n",
+                    static_cast<long long>(detector->num_classes()));
+    }
+
     // --- One context per virtual camera ---
     std::vector<std::unique_ptr<StreamCtx>> streams;
     for (const auto& v : videos) {
-        auto ctx = std::make_unique<StreamCtx>(v, scratch_bytes);
+        auto ctx = std::make_unique<StreamCtx>(v, scratch_bytes,
+                                               detector->head_channels());
         const auto info = ctx->source.info();
         std::printf("stream %-14s %dx%d @ %.1f fps\n",
                     ctx->stats.name().c_str(), info.width, info.height, info.fps);
@@ -216,9 +228,10 @@ int main(int argc, char* argv[]) {
                                    static_cast<std::size_t>(frame->height);
                 s.annotated.assign(bytes, 0u);
                 std::memcpy(s.annotated.data(), frame->data, bytes);
-                vision::draw_detections(s.annotated.data(),
-                                        frame->width, frame->height, frame->stride,
-                                        dets, /*thickness=*/3);
+                vision::draw_detections_labeled(s.annotated.data(),
+                                                frame->width, frame->height,
+                                                frame->stride, dets, kClassNames,
+                                                /*thickness=*/3, /*label_scale=*/3);
                 const std::string path = out_dir + "/" + s.stats.name() + "_snapshot.ppm";
                 vision::write_ppm(path, s.annotated.data(),
                                   frame->width, frame->height, frame->stride);
