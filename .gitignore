@@ -1,0 +1,19 @@
+# Build
+build/
+build-*/
+cmake-build-*/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Outputs
+output/
+*.ppm
+*.png
+
+# OS
+.DS_Store
