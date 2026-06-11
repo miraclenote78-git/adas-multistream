@@ -118,6 +118,45 @@ struct StreamCtx {
     std::int64_t               frames_done{0};
 };
 
+// BLIP-caption-style bottom bar: black band + one line of scene summary,
+// e.g. "drive right  frame 300  objects 6  car 3 motorcycle 2 person 1  infer 0.33 ms".
+void draw_analysis_bar(std::uint8_t* buf, int width, int height, int stride,
+                       const std::string& stream_name, std::int64_t frame_idx,
+                       const std::vector<model::Detection>& dets,
+                       double infer_ms) {
+    std::vector<int> count(kClassNames.size(), 0);
+    for (const auto& d : dets) {
+        const auto k = static_cast<std::size_t>(d.cls_id);
+        if (k < count.size()) ++count[k];
+    }
+    char text[256];
+    int n = std::snprintf(text, sizeof(text), "%s  frame %lld  objects %zu  ",
+                          stream_name.c_str(),
+                          static_cast<long long>(frame_idx), dets.size());
+    for (std::size_t k = 0; k < count.size(); ++k) {
+        if (count[k] > 0 && n < static_cast<int>(sizeof(text))) {
+            n += std::snprintf(text + n, sizeof(text) - static_cast<std::size_t>(n),
+                               "%s %d  ", kClassNames[k].c_str(), count[k]);
+        }
+    }
+    if (n < static_cast<int>(sizeof(text))) {
+        std::snprintf(text + n, sizeof(text) - static_cast<std::size_t>(n),
+                      " infer %.2f ms", infer_ms);
+    }
+
+    // Bar geometry scales with the frame so 1080p and 576p look alike.
+    const int scale = std::max(2, height / 360);     // 1080p → 3
+    const int text_h = 7 * scale;
+    const int pad = 4 * scale;
+    const int bar_h = text_h + 2 * pad;
+    vision::draw_filled_rect(buf, width, height, stride,
+                             0, height - bar_h, width - 1, height - 1,
+                             0, 0, 0);
+    vision::draw_label(buf, width, height, stride,
+                       pad, height - bar_h + pad, text,
+                       255, 255, 255, scale);
+}
+
 void print_report(const std::vector<std::unique_ptr<StreamCtx>>& streams,
                   double wall_s) {
     std::int64_t total_frames = 0;
@@ -297,6 +336,9 @@ int main(int argc, char* argv[]) {
                                                 frame->width, frame->height,
                                                 frame->stride, dets, kClassNames,
                                                 /*thickness=*/3, /*label_scale=*/3);
+                draw_analysis_bar(s.annotated.data(),
+                                  frame->width, frame->height, frame->stride,
+                                  s.stats.name(), s.frames_done, dets, infer_ms);
                 const std::string path = out_dir + "/" + s.stats.name() + "_snapshot.ppm";
                 vision::write_ppm(path, s.annotated.data(),
                                   frame->width, frame->height, frame->stride);
