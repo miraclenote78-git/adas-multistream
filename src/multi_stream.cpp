@@ -26,6 +26,10 @@
 //       [--snapshot N]       write one annotated PPM per stream at frame N
 //                            (default 60; pass -1 to disable)
 //       [--weights F.vpnw]   load trained weights (default: synthesized)
+//       [--temporal N]       only report detections confirmed in N
+//                            consecutive frames (0 = off, default).
+//                            Flickering false positives die; persistent
+//                            objects pay N-1 frames of latency.
 //
 // Per-class thresholds are applied here, in the application: the SDK's
 // decode provides the mechanism (one floor threshold), the app owns the
@@ -34,6 +38,7 @@
 // its own class's threshold before NMS.
 
 #include "stream_stats.hpp"
+#include "temporal_filter.hpp"
 
 #include "visionpipe/model/detection.hpp"
 #include "visionpipe/model/tiny_detector.hpp"
@@ -83,11 +88,12 @@ const std::vector<std::string> kClassNames = {
 // camera's traffic from fragmenting another's memory.
 struct StreamCtx {
     StreamCtx(const std::string& path, std::size_t scratch_bytes,
-              std::int64_t head_ch)
+              std::int64_t head_ch, int temporal_hits)
         : source(path, vision::VideoFileOptions{vision::PixelFormat::kRgb24, /*loop=*/false}),
           io_arena(1 * 1024 * 1024),
           scratch(scratch_bytes),
           stats(fs::path(path).stem().string()),
+          filter(temporal_hits, /*max_misses=*/2, /*iou_match=*/0.3f),
           small_rgb(static_cast<std::size_t>(kInW * kInH * 3)) {
         auto* in_buf = io_arena.allocate(
             static_cast<std::size_t>(3 * kInH * kInW) * sizeof(float),
@@ -103,6 +109,7 @@ struct StreamCtx {
     runtime::ArenaAllocator    io_arena;
     runtime::ArenaAllocator    scratch;
     adas::StreamStats          stats;
+    adas::TemporalFilter       filter;
     std::vector<std::uint8_t>  small_rgb;
     std::vector<std::uint8_t>  annotated;
     runtime::Tensor            input{};
@@ -125,18 +132,18 @@ void print_report(const std::vector<std::unique_ptr<StreamCtx>>& streams,
     std::printf("══════════════════════════════════════════════════════════════════════════\n");
     std::printf(" %-14s %7s %9s │ %-25s │ %-25s │ %s\n",
                 "stream", "frames", "fps", "decode ms (avg/p95/p99)",
-                "infer ms (avg/p95/p99)", "det/frame");
+                "infer ms (avg/p95/p99)", "det/frame raw→conf");
     std::printf("────────────────────────────────────────────────────────────────────────────\n");
     for (const auto& s : streams) {
         const auto dec = s->stats.decode_summary();
         const auto inf = s->stats.infer_summary();
         const double fps = static_cast<double>(s->frames_done) / wall_s;
-        std::printf(" %-14s %7lld %8.1f  │ %7.2f / %6.2f / %6.2f │ %7.2f / %6.2f / %6.2f │ %6.1f\n",
+        std::printf(" %-14s %7lld %8.1f  │ %7.2f / %6.2f / %6.2f │ %7.2f / %6.2f / %6.2f │ %5.1f → %5.1f\n",
                     s->stats.name().c_str(),
                     static_cast<long long>(s->frames_done), fps,
                     dec.mean_ms, dec.p95_ms, dec.p99_ms,
                     inf.mean_ms, inf.p95_ms, inf.p99_ms,
-                    s->stats.avg_detections());
+                    s->stats.avg_raw(), s->stats.avg_confirmed());
     }
     std::printf("══════════════════════════════════════════════════════════════════════════\n");
 }
@@ -158,6 +165,7 @@ int main(int argc, char* argv[]) {
     std::int64_t max_frames     = -1;
     float        threshold      = 0.5f;
     std::int64_t snapshot_frame = 60;
+    int          temporal_hits  = 0;
 
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -165,6 +173,7 @@ int main(int argc, char* argv[]) {
         else if (a == "--threshold" && i + 1 < argc) threshold = static_cast<float>(std::atof(argv[++i]));
         else if (a == "--snapshot" && i + 1 < argc)  snapshot_frame = std::atoll(argv[++i]);
         else if (a == "--weights" && i + 1 < argc)   weights_path = argv[++i];
+        else if (a == "--temporal" && i + 1 < argc)  temporal_hits = std::atoi(argv[++i]);
         else if (a == "--cls" && i + 1 < argc) {
             const std::string kv = argv[++i];
             const auto eq = kv.find('=');
@@ -218,11 +227,18 @@ int main(int argc, char* argv[]) {
     const float decode_threshold =
         *std::min_element(cls_threshold.begin(), cls_threshold.end());
 
+    if (temporal_hits > 1) {
+        std::printf("temporal: confirm after %d consecutive frames "
+                    "(~%.0f ms latency @ 30 fps)\n",
+                    temporal_hits, (temporal_hits - 1) * 1000.0 / 30.0);
+    }
+
     // --- One context per virtual camera ---
     std::vector<std::unique_ptr<StreamCtx>> streams;
     for (const auto& v : videos) {
         auto ctx = std::make_unique<StreamCtx>(v, scratch_bytes,
-                                               detector->head_channels());
+                                               detector->head_channels(),
+                                               temporal_hits);
         const auto info = ctx->source.info();
         std::printf("stream %-14s %dx%d @ %.1f fps\n",
                     ctx->stats.name().c_str(), info.width, info.height, info.fps);
@@ -263,9 +279,11 @@ int main(int argc, char* argv[]) {
                            }),
                        dets.end());
             dets = model::nms(std::move(dets), /*iou_threshold=*/0.45f);
+            const std::size_t raw_count = dets.size();
+            dets = s.filter.update(std::move(dets));
             const double infer_ms = ms_since(t_inf);
 
-            s.stats.record_frame(decode_ms, infer_ms, dets.size());
+            s.stats.record_frame(decode_ms, infer_ms, raw_count, dets.size());
 
             if (s.frames_done == snapshot_frame) {
                 const float sx = static_cast<float>(frame->width)  / static_cast<float>(kInW);

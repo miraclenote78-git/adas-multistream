@@ -26,19 +26,24 @@ class StreamStats {
 public:
     explicit StreamStats(std::string name) : name_(std::move(name)) {}
 
-    void record_frame(double decode_ms, double infer_ms, std::size_t detections) {
+    void record_frame(double decode_ms, double infer_ms,
+                      std::size_t raw_detections, std::size_t confirmed_detections) {
         decode_ms_.push_back(decode_ms);
         infer_ms_.push_back(infer_ms);
-        total_detections_ += detections;
+        total_raw_ += raw_detections;
+        total_confirmed_ += confirmed_detections;
     }
 
     const std::string& name() const noexcept { return name_; }
     std::size_t frames() const noexcept { return infer_ms_.size(); }
-    std::size_t total_detections() const noexcept { return total_detections_; }
 
-    double avg_detections() const noexcept {
+    double avg_raw() const noexcept {
         return frames() == 0 ? 0.0
-            : static_cast<double>(total_detections_) / static_cast<double>(frames());
+            : static_cast<double>(total_raw_) / static_cast<double>(frames());
+    }
+    double avg_confirmed() const noexcept {
+        return frames() == 0 ? 0.0
+            : static_cast<double>(total_confirmed_) / static_cast<double>(frames());
     }
 
     LatencySummary decode_summary() const { return summarize(decode_ms_); }
@@ -71,7 +76,8 @@ private:
     std::string name_;
     std::vector<double> decode_ms_;
     std::vector<double> infer_ms_;
-    std::size_t total_detections_{0};
+    std::size_t total_raw_{0};
+    std::size_t total_confirmed_{0};
 };
 
 }  // namespace adas

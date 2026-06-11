@@ -53,6 +53,7 @@ Options:
 | `--cls name=T` | per-class threshold override, repeatable (e.g. `--cls person=0.35`) | base |
 | `--snapshot N` | write annotated PPM per stream at frame N (-1 = off) | 60 |
 | `--weights F.vpnw` | load trained weights | synthesized (untrained) |
+| `--temporal N` | confirm detections only after N consecutive matched frames (0 = off) | 0 |
 
 Per-class thresholds are an *application policy*: the SDK decodes at the
 minimum threshold (mechanism), then each detection must clear its own
@@ -60,6 +61,29 @@ class's bar before NMS. Useful when classes have asymmetric confidence
 distributions — e.g. `--threshold 0.55 --cls person=0.35` keeps night-time
 "car" false positives out while letting weaker-but-real person
 detections through.
+
+### Temporal confirmation (`--temporal N`)
+
+A threshold is a 1-D knob and cannot separate overlapping score
+distributions (a night-time light-blob "car 0.63" vs a distant real
+"car 0.58"). The time axis can: real objects persist, flickers don't.
+`--temporal N` runs a tiny greedy-IoU tracker per stream
+(`src/temporal_filter.hpp`) and only reports detections matched in N
+consecutive frames (track survives 2 missed frames).
+
+Measured (threshold 0.55, person 0.35, motorcycle/bicycle 0.4):
+
+| setting | night FP (rear, frame 300) | city scooter (right) | det/frame raw→conf |
+|---|---|---|---|
+| off | `car 0.63` visible | kept | 8.3 → 8.3 |
+| `--temporal 2` ⭐ | **gone** | kept | 8.3 → 7.6 |
+| `--temporal 3` | gone | **lost** (fast motion breaks IoU match at 8×8 grid) | 8.3 → 7.0 |
+
+Trade-offs: confirmation adds (N-1) frames of detection latency
+(~33 ms/frame @ 30 fps), and large near-field objects move too fast for
+plain IoU association at this grid resolution — the textbook next step
+is motion-compensated matching (constant-velocity prediction, i.e. a
+minimal Kalman filter).
 
 ### Real detection
 
