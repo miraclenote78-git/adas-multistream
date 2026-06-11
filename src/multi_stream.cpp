@@ -19,10 +19,19 @@
 // Usage:
 //   multi_stream <out_dir> <video1> [video2 ...]
 //       [--max-frames N]     stop each stream after N frames (default: all)
-//       [--threshold T]      detection score threshold (default 0.5)
+//       [--threshold T]      base detection score threshold (default 0.5)
+//       [--cls name=T]       per-class threshold override, repeatable
+//                            (e.g. --cls person=0.35 --cls car=0.6);
+//                            classes without an override use --threshold
 //       [--snapshot N]       write one annotated PPM per stream at frame N
 //                            (default 60; pass -1 to disable)
 //       [--weights F.vpnw]   load trained weights (default: synthesized)
+//
+// Per-class thresholds are applied here, in the application: the SDK's
+// decode provides the mechanism (one floor threshold), the app owns the
+// policy (which classes deserve a lower bar). Decoding happens at the
+// minimum of all thresholds, then each detection is re-checked against
+// its own class's threshold before NMS.
 
 #include "stream_stats.hpp"
 
@@ -36,6 +45,7 @@
 #include "visionpipe/vision/preprocess.hpp"
 #include "visionpipe/vision/video_file_source.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -43,6 +53,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace visionpipe;
@@ -142,6 +153,7 @@ int main(int argc, char* argv[]) {
 
     const std::string out_dir = argv[1];
     std::vector<std::string> videos;
+    std::vector<std::pair<std::string, float>> cls_overrides;
     std::string  weights_path;
     std::int64_t max_frames     = -1;
     float        threshold      = 0.5f;
@@ -153,6 +165,16 @@ int main(int argc, char* argv[]) {
         else if (a == "--threshold" && i + 1 < argc) threshold = static_cast<float>(std::atof(argv[++i]));
         else if (a == "--snapshot" && i + 1 < argc)  snapshot_frame = std::atoll(argv[++i]);
         else if (a == "--weights" && i + 1 < argc)   weights_path = argv[++i];
+        else if (a == "--cls" && i + 1 < argc) {
+            const std::string kv = argv[++i];
+            const auto eq = kv.find('=');
+            if (eq == std::string::npos) {
+                std::fprintf(stderr, "--cls expects name=threshold, got '%s'\n", kv.c_str());
+                return 2;
+            }
+            cls_overrides.emplace_back(kv.substr(0, eq),
+                                       static_cast<float>(std::atof(kv.c_str() + eq + 1)));
+        }
         else videos.push_back(a);
     }
     if (videos.empty()) {
@@ -178,6 +200,23 @@ int main(int argc, char* argv[]) {
         std::printf("classes: %lld\n",
                     static_cast<long long>(detector->num_classes()));
     }
+
+    // Per-class thresholds: every class starts at the base threshold,
+    // --cls overrides take precedence. decode runs at the minimum so no
+    // class is filtered before its own threshold gets a say.
+    std::vector<float> cls_threshold(kClassNames.size(), threshold);
+    for (const auto& [name, t] : cls_overrides) {
+        const auto it = std::find(kClassNames.begin(), kClassNames.end(), name);
+        if (it == kClassNames.end()) {
+            std::fprintf(stderr, "--cls: unknown class '%s'\n", name.c_str());
+            return 2;
+        }
+        cls_threshold[static_cast<std::size_t>(it - kClassNames.begin())] = t;
+        std::printf("threshold: %s = %.2f (base %.2f)\n", name.c_str(),
+                    static_cast<double>(t), static_cast<double>(threshold));
+    }
+    const float decode_threshold =
+        *std::min_element(cls_threshold.begin(), cls_threshold.end());
 
     // --- One context per virtual camera ---
     std::vector<std::unique_ptr<StreamCtx>> streams;
@@ -214,7 +253,15 @@ int main(int argc, char* argv[]) {
                                        s.input);
             detector->forward(s.input, s.scratch, s.output);
             auto dets = model::decode_tiny_detector_output(s.output, /*batch_index=*/0,
-                                                           kInW, kInH, threshold);
+                                                           kInW, kInH, decode_threshold);
+            // App policy: each class clears its own bar before NMS.
+            dets.erase(std::remove_if(dets.begin(), dets.end(),
+                           [&](const model::Detection& d) {
+                               const auto k = static_cast<std::size_t>(d.cls_id);
+                               return k < cls_threshold.size() &&
+                                      d.score < cls_threshold[k];
+                           }),
+                       dets.end());
             dets = model::nms(std::move(dets), /*iou_threshold=*/0.45f);
             const double infer_ms = ms_since(t_inf);
 

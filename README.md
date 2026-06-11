@@ -49,9 +49,17 @@ Options:
 | flag | meaning | default |
 |---|---|---|
 | `--max-frames N` | stop each stream after N frames | all |
-| `--threshold T` | detection score threshold | 0.5 |
+| `--threshold T` | base detection score threshold | 0.5 |
+| `--cls name=T` | per-class threshold override, repeatable (e.g. `--cls person=0.35`) | base |
 | `--snapshot N` | write annotated PPM per stream at frame N (-1 = off) | 60 |
 | `--weights F.vpnw` | load trained weights | synthesized (untrained) |
+
+Per-class thresholds are an *application policy*: the SDK decodes at the
+minimum threshold (mechanism), then each detection must clear its own
+class's bar before NMS. Useful when classes have asymmetric confidence
+distributions — e.g. `--threshold 0.55 --cls person=0.35` keeps night-time
+"car" false positives out while letting weaker-but-real person
+detections through.
 
 ### Real detection
 
