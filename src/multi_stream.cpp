@@ -57,7 +57,9 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -116,6 +118,7 @@ struct StreamCtx {
     runtime::Tensor            output{};
     bool                       alive{true};
     std::int64_t               frames_done{0};
+    int                        npu{0};       // which simulated NPU owns this stream
 };
 
 // BLIP-caption-style bottom bar: black band + one line of scene summary,
@@ -169,20 +172,32 @@ void print_report(const std::vector<std::unique_ptr<StreamCtx>>& streams,
     std::printf(" aggregate throughput: %.1f fps (all streams combined)\n",
                 static_cast<double>(total_frames) / wall_s);
     std::printf("══════════════════════════════════════════════════════════════════════════\n");
-    std::printf(" %-14s %7s %9s │ %-25s │ %-25s │ %s\n",
-                "stream", "frames", "fps", "decode ms (avg/p95/p99)",
+    std::printf(" %-4s %-14s %7s %9s │ %-25s │ %-25s │ %s\n",
+                "npu", "stream", "frames", "fps", "decode ms (avg/p95/p99)",
                 "infer ms (avg/p95/p99)", "det/frame raw→conf");
     std::printf("────────────────────────────────────────────────────────────────────────────\n");
-    for (const auto& s : streams) {
-        const auto dec = s->stats.decode_summary();
-        const auto inf = s->stats.infer_summary();
-        const double fps = static_cast<double>(s->frames_done) / wall_s;
-        std::printf(" %-14s %7lld %8.1f  │ %7.2f / %6.2f / %6.2f │ %7.2f / %6.2f / %6.2f │ %5.1f → %5.1f\n",
-                    s->stats.name().c_str(),
-                    static_cast<long long>(s->frames_done), fps,
-                    dec.mean_ms, dec.p95_ms, dec.p99_ms,
-                    inf.mean_ms, inf.p95_ms, inf.p99_ms,
-                    s->stats.avg_raw(), s->stats.avg_confirmed());
+    int max_npu = 0;
+    for (const auto& s : streams) max_npu = std::max(max_npu, s->npu);
+    for (int n = 0; n <= max_npu; ++n) {
+        std::int64_t npu_frames = 0;
+        for (const auto& s : streams) {
+            if (s->npu != n) continue;
+            npu_frames += s->frames_done;
+            const auto dec = s->stats.decode_summary();
+            const auto inf = s->stats.infer_summary();
+            const double fps = static_cast<double>(s->frames_done) / wall_s;
+            std::printf(" %-4d %-14s %7lld %8.1f  │ %7.2f / %6.2f / %6.2f │ %7.2f / %6.2f / %6.2f │ %5.1f → %5.1f\n",
+                        n, s->stats.name().c_str(),
+                        static_cast<long long>(s->frames_done), fps,
+                        dec.mean_ms, dec.p95_ms, dec.p99_ms,
+                        inf.mean_ms, inf.p95_ms, inf.p99_ms,
+                        s->stats.avg_raw(), s->stats.avg_confirmed());
+        }
+        if (max_npu > 0) {
+            std::printf(" %-4d %-14s %7lld %8.1f  │ (npu%d subtotal)\n",
+                        n, "── subtotal", static_cast<long long>(npu_frames),
+                        static_cast<double>(npu_frames) / wall_s, n);
+        }
     }
     std::printf("══════════════════════════════════════════════════════════════════════════\n");
 }
@@ -205,6 +220,7 @@ int main(int argc, char* argv[]) {
     float        threshold      = 0.5f;
     std::int64_t snapshot_frame = 60;
     int          temporal_hits  = 0;
+    int          num_npus       = 1;
 
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -213,6 +229,7 @@ int main(int argc, char* argv[]) {
         else if (a == "--snapshot" && i + 1 < argc)  snapshot_frame = std::atoll(argv[++i]);
         else if (a == "--weights" && i + 1 < argc)   weights_path = argv[++i];
         else if (a == "--temporal" && i + 1 < argc)  temporal_hits = std::atoi(argv[++i]);
+        else if (a == "--npus" && i + 1 < argc)      num_npus = std::atoi(argv[++i]);
         else if (a == "--cls" && i + 1 < argc) {
             const std::string kv = argv[++i];
             const auto eq = kv.find('=');
@@ -231,22 +248,35 @@ int main(int argc, char* argv[]) {
     }
     fs::create_directories(out_dir);
 
-    // --- The "one NPU": a single shared detector ---
-    runtime::ArenaAllocator weights(1 * 1024 * 1024);
-    std::unique_ptr<model::TinyDetector> detector;
-    if (weights_path.empty()) {
-        std::printf("weights: synthesized (untrained — boxes are not meaningful)\n");
-        detector = std::make_unique<model::TinyDetector>(weights, /*batch=*/1);
-    } else {
-        std::printf("weights: %s\n", weights_path.c_str());
-        model::WeightFile wf(weights_path);
-        detector = std::make_unique<model::TinyDetector>(wf, weights, /*batch=*/1);
+    // --- Simulated NPUs ---
+    // One NPU = one detector instance (its own weight copy, modeling the
+    // NPU's private SRAM) + one worker thread (independent compute).
+    if (num_npus < 1) num_npus = 1;
+    std::vector<std::unique_ptr<runtime::ArenaAllocator>> npu_weight_arenas;
+    std::vector<std::unique_ptr<model::TinyDetector>> npus;
+    {
+        std::unique_ptr<model::WeightFile> wf;
+        if (weights_path.empty()) {
+            std::printf("weights: synthesized (untrained — boxes are not meaningful)\n");
+        } else {
+            std::printf("weights: %s\n", weights_path.c_str());
+            wf = std::make_unique<model::WeightFile>(weights_path);
+        }
+        for (int n = 0; n < num_npus; ++n) {
+            npu_weight_arenas.push_back(
+                std::make_unique<runtime::ArenaAllocator>(1 * 1024 * 1024));
+            npus.push_back(wf
+                ? std::make_unique<model::TinyDetector>(*wf, *npu_weight_arenas.back(), 1)
+                : std::make_unique<model::TinyDetector>(*npu_weight_arenas.back(), 1));
+        }
     }
-    const std::size_t scratch_bytes = detector->recommended_scratch_bytes();
+    model::TinyDetector& detector0 = *npus.front();
+    const std::size_t scratch_bytes = detector0.recommended_scratch_bytes();
 
-    if (detector->num_classes() > 0) {
+    std::printf("npus: %d (1 detector instance + 1 worker thread each)\n", num_npus);
+    if (detector0.num_classes() > 0) {
         std::printf("classes: %lld\n",
-                    static_cast<long long>(detector->num_classes()));
+                    static_cast<long long>(detector0.num_classes()));
     }
 
     // Per-class thresholds: every class starts at the base threshold,
@@ -272,85 +302,100 @@ int main(int argc, char* argv[]) {
                     temporal_hits, (temporal_hits - 1) * 1000.0 / 30.0);
     }
 
-    // --- One context per virtual camera ---
+    // --- One context per virtual camera; static placement i % npus ---
     std::vector<std::unique_ptr<StreamCtx>> streams;
-    for (const auto& v : videos) {
-        auto ctx = std::make_unique<StreamCtx>(v, scratch_bytes,
-                                               detector->head_channels(),
+    for (std::size_t i = 0; i < videos.size(); ++i) {
+        auto ctx = std::make_unique<StreamCtx>(videos[i], scratch_bytes,
+                                               detector0.head_channels(),
                                                temporal_hits);
+        ctx->npu = static_cast<int>(i) % num_npus;
         const auto info = ctx->source.info();
-        std::printf("stream %-14s %dx%d @ %.1f fps\n",
-                    ctx->stats.name().c_str(), info.width, info.height, info.fps);
+        std::printf("stream %-14s %dx%d @ %.1f fps → npu%d\n",
+                    ctx->stats.name().c_str(), info.width, info.height, info.fps,
+                    ctx->npu);
         streams.push_back(std::move(ctx));
     }
 
-    // --- Round-robin scheduling loop ---
-    const auto t_start = Clock::now();
-    std::size_t live = streams.size();
-    while (live > 0) {
-        for (auto& sp : streams) {
-            StreamCtx& s = *sp;
-            if (!s.alive) continue;
-            if (max_frames >= 0 && s.frames_done >= max_frames) {
-                s.alive = false; --live; continue;
+    // --- Per-NPU worker: round-robin over the streams this NPU owns ---
+    std::mutex io_mu;
+    auto run_npu = [&](int npu_id) {
+        model::TinyDetector& npu_det = *npus[static_cast<std::size_t>(npu_id)];
+        std::size_t live = 0;
+        for (const auto& sp : streams)
+            if (sp->npu == npu_id) ++live;
+
+        while (live > 0) {
+            for (auto& sp : streams) {
+                StreamCtx& s = *sp;
+                if (s.npu != npu_id || !s.alive) continue;
+                if (max_frames >= 0 && s.frames_done >= max_frames) {
+                    s.alive = false; --live; continue;
+                }
+
+                const auto t_dec = Clock::now();
+                auto frame = s.source.next_frame();
+                if (!frame) { s.alive = false; --live; continue; }
+                const double decode_ms = ms_since(t_dec);
+
+                const auto t_inf = Clock::now();
+                vision::resize_rgb24_nn(frame->data, frame->width, frame->height,
+                                        frame->stride,
+                                        s.small_rgb.data(), kInW, kInH, kInW * 3);
+                vision::rgb24_to_nchw_fp32(s.small_rgb.data(), kInW, kInH, kInW * 3,
+                                           s.input);
+                npu_det.forward(s.input, s.scratch, s.output);
+                auto dets = model::decode_tiny_detector_output(s.output, /*batch_index=*/0,
+                                                               kInW, kInH, decode_threshold);
+                // App policy: each class clears its own bar before NMS.
+                dets.erase(std::remove_if(dets.begin(), dets.end(),
+                               [&](const model::Detection& d) {
+                                   const auto k = static_cast<std::size_t>(d.cls_id);
+                                   return k < cls_threshold.size() &&
+                                          d.score < cls_threshold[k];
+                               }),
+                           dets.end());
+                dets = model::nms(std::move(dets), /*iou_threshold=*/0.45f);
+                const std::size_t raw_count = dets.size();
+                dets = s.filter.update(std::move(dets));
+                const double infer_ms = ms_since(t_inf);
+
+                s.stats.record_frame(decode_ms, infer_ms, raw_count, dets.size());
+
+                if (s.frames_done == snapshot_frame) {
+                    const float sx = static_cast<float>(frame->width)  / static_cast<float>(kInW);
+                    const float sy = static_cast<float>(frame->height) / static_cast<float>(kInH);
+                    for (auto& d : dets) { d.cx *= sx; d.cy *= sy; d.w *= sx; d.h *= sy; }
+                    const auto bytes = static_cast<std::size_t>(frame->stride) *
+                                       static_cast<std::size_t>(frame->height);
+                    s.annotated.assign(bytes, 0u);
+                    std::memcpy(s.annotated.data(), frame->data, bytes);
+                    vision::draw_detections_labeled(s.annotated.data(),
+                                                    frame->width, frame->height,
+                                                    frame->stride, dets, kClassNames,
+                                                    /*thickness=*/3, /*label_scale=*/3);
+                    draw_analysis_bar(s.annotated.data(),
+                                      frame->width, frame->height, frame->stride,
+                                      s.stats.name(), s.frames_done, dets, infer_ms);
+                    const std::string path = out_dir + "/" + s.stats.name() + "_snapshot.ppm";
+                    vision::write_ppm(path, s.annotated.data(),
+                                      frame->width, frame->height, frame->stride);
+                    std::lock_guard<std::mutex> lk(io_mu);
+                    std::printf("  [npu%d:%s] snapshot @ frame %lld → %s (%zu dets)\n",
+                                npu_id, s.stats.name().c_str(),
+                                static_cast<long long>(s.frames_done),
+                                path.c_str(), dets.size());
+                }
+
+                ++s.frames_done;
             }
-
-            const auto t_dec = Clock::now();
-            auto frame = s.source.next_frame();
-            if (!frame) { s.alive = false; --live; continue; }
-            const double decode_ms = ms_since(t_dec);
-
-            const auto t_inf = Clock::now();
-            vision::resize_rgb24_nn(frame->data, frame->width, frame->height,
-                                    frame->stride,
-                                    s.small_rgb.data(), kInW, kInH, kInW * 3);
-            vision::rgb24_to_nchw_fp32(s.small_rgb.data(), kInW, kInH, kInW * 3,
-                                       s.input);
-            detector->forward(s.input, s.scratch, s.output);
-            auto dets = model::decode_tiny_detector_output(s.output, /*batch_index=*/0,
-                                                           kInW, kInH, decode_threshold);
-            // App policy: each class clears its own bar before NMS.
-            dets.erase(std::remove_if(dets.begin(), dets.end(),
-                           [&](const model::Detection& d) {
-                               const auto k = static_cast<std::size_t>(d.cls_id);
-                               return k < cls_threshold.size() &&
-                                      d.score < cls_threshold[k];
-                           }),
-                       dets.end());
-            dets = model::nms(std::move(dets), /*iou_threshold=*/0.45f);
-            const std::size_t raw_count = dets.size();
-            dets = s.filter.update(std::move(dets));
-            const double infer_ms = ms_since(t_inf);
-
-            s.stats.record_frame(decode_ms, infer_ms, raw_count, dets.size());
-
-            if (s.frames_done == snapshot_frame) {
-                const float sx = static_cast<float>(frame->width)  / static_cast<float>(kInW);
-                const float sy = static_cast<float>(frame->height) / static_cast<float>(kInH);
-                for (auto& d : dets) { d.cx *= sx; d.cy *= sy; d.w *= sx; d.h *= sy; }
-                const auto bytes = static_cast<std::size_t>(frame->stride) *
-                                   static_cast<std::size_t>(frame->height);
-                s.annotated.assign(bytes, 0u);
-                std::memcpy(s.annotated.data(), frame->data, bytes);
-                vision::draw_detections_labeled(s.annotated.data(),
-                                                frame->width, frame->height,
-                                                frame->stride, dets, kClassNames,
-                                                /*thickness=*/3, /*label_scale=*/3);
-                draw_analysis_bar(s.annotated.data(),
-                                  frame->width, frame->height, frame->stride,
-                                  s.stats.name(), s.frames_done, dets, infer_ms);
-                const std::string path = out_dir + "/" + s.stats.name() + "_snapshot.ppm";
-                vision::write_ppm(path, s.annotated.data(),
-                                  frame->width, frame->height, frame->stride);
-                std::printf("  [%s] snapshot @ frame %lld → %s (%zu dets)\n",
-                            s.stats.name().c_str(),
-                            static_cast<long long>(s.frames_done),
-                            path.c_str(), dets.size());
-            }
-
-            ++s.frames_done;
         }
-    }
+    };
+
+    // --- Launch one thread per NPU; each runs independently ---
+    const auto t_start = Clock::now();
+    std::vector<std::thread> workers;
+    for (int n = 0; n < num_npus; ++n) workers.emplace_back(run_npu, n);
+    for (auto& w : workers) w.join();
     const double wall_s = ms_since(t_start) / 1000.0;
 
     print_report(streams, wall_s);

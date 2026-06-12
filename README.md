@@ -54,6 +54,35 @@ Options:
 | `--snapshot N` | write annotated PPM per stream at frame N (-1 = off) | 60 |
 | `--weights F.vpnw` | load trained weights | synthesized (untrained) |
 | `--temporal N` | confirm detections only after N consecutive matched frames (0 = off) | 0 |
+| `--npus N` | number of simulated NPUs (1 detector instance + 1 worker thread each) | 1 |
+
+### Multi-NPU simulation (`--npus N`)
+
+One NPU = one detector instance (its own weight copy, modeling the NPU's
+private SRAM) + one worker thread (independent compute). Streams are
+placed statically: stream *i* → NPU *i mod N* — so the CLI order of the
+videos **is** the placement policy.
+
+Measured (same 4 videos, trained weights, temporal 2, no snapshots):
+
+| config | aggregate fps | scaling | note |
+|---|---|---|---|
+| `--npus 1` | 313 | 1.00× | baseline |
+| `--npus 2` (default order) | 534 | 1.71× | npu0 got both slow-decode streams (front+left) — imbalance |
+| `--npus 2` (reordered: slow+fast pairs) | **566** | 1.81× | +6% from placement alone |
+| `--npus 4` | 1013 | 3.23× | one stream per NPU |
+
+Two lessons made measurable:
+
+1. **Scale-out works but placement decides the yield** — wall time is
+   gated by the slowest NPU, so pairing the two slowest streams on one
+   NPU wastes the other's idle time. On a real chiplet system this is
+   the stream-to-eFPGA SoC assignment problem.
+2. **Imperfect scaling is shared-resource contention** — per-stream
+   decode latency rises slightly with more threads (3.33 → 3.47 ms)
+   because all "NPUs" share one memory subsystem, exactly like chiplets
+   sharing an interconnect. Dynamic placement / work stealing is the
+   natural next step.
 
 Per-class thresholds are an *application policy*: the SDK decodes at the
 minimum threshold (mechanism), then each detection must clear its own
