@@ -9,7 +9,7 @@ Four driving videos play the role of four vehicle cameras
 the demo exercises exactly the questions a multi-camera SoC platform team
 lives with:
 
-- Who gets the NPU next? (scheduling — round-robin)
+- Who gets the NPU next? (scheduling — decode/infer work-stealing pipeline)
 - How is memory partitioned per stream? (per-stream `ArenaAllocator`)
 - Where does the time go? (decode vs inference, mean and tail latency)
 
@@ -54,46 +54,52 @@ Options:
 | `--snapshot N` | write annotated PPM per stream at frame N (-1 = off) | 60 |
 | `--weights F.vpnw` | load trained weights | synthesized (untrained) |
 | `--temporal N` | confirm detections only after N consecutive matched frames (0 = off) | 0 |
-| `--npus N` | number of simulated NPUs (1 detector instance + 1 worker thread each) | 1 |
+| `--npus N` | number of NPU (inference) threads, each its own detector instance | 1 |
+| `--decoders N` | number of decode threads feeding the NPUs | = `--npus` |
 
-### Multi-NPU simulation (`--npus N`)
+### Decode/infer pipeline (`--npus N`, `--decoders M`)
 
 One NPU = one detector instance (its own weight copy, modeling the NPU's
-private SRAM) + one worker thread (independent compute). Streams are **not**
-pinned to an NPU: they all sit in one shared scheduler and each NPU pulls the
-next ready stream, runs one frame, and returns it to the back of the queue
-(`StreamScheduler` in `src/multi_stream.cpp`). A stream is the unit of work —
-never a single frame — because each stream is stateful (decoder position,
-temporal tracks) and must never be touched by two NPUs at once. A faster NPU
-simply drains more frames, so the load balances itself with no hand-tuned
-placement. The report's per-NPU `frames` / `util%` columns show the result.
+private SRAM) + one inference thread. **Decode and inference run in separate
+thread pools**: `M` decode threads (slow H.264 software decode + preprocess,
+~3.3 ms/frame) feed `N` NPU threads (inference, ~0.33 ms) through a bounded
+per-stream buffer, so the two stages overlap instead of running back-to-back
+on one thread (`Pipeline` in `src/multi_stream.cpp`).
+
+Both pools steal work independently. Within a stage a stream is single-flight
+(its stateful decoder / temporal tracks are never touched concurrently and
+frames stay in order); *across* stages the same stream may decode frame N+1
+while the NPU infers frame N — that overlap is the point. Streams are still
+the unit of work, never raw frames. The report's per-pool `frames` / `util%`
+columns show where the time goes.
 
 Measured (same 4 videos, trained weights, temporal 2, no snapshots):
 
-| config | aggregate fps | scaling | per-NPU balance |
+| config | aggregate fps | NPU util | what it shows |
 |---|---|---|---|
-| `--npus 1` | 318 | 1.00× | baseline |
-| `--npus 2` | **614** | 1.93× | frames 1446/1434, util 100%/99% — even |
-| `--npus 4` | 1042 | 3.28× | frames 615…823, capped by 4-stream concurrency |
+| `--npus 1 --decoders 1` | 347 | 11% | decode saturates (100%), the NPU sits idle |
+| `--npus 1 --decoders 4` | **1035** | 69% | **+3× from decode threads alone — one NPU is enough** |
+| `--npus 4 --decoders 4` | 1039 | 19%×4 | four NPUs barely used; throughput is decode-bound |
 
-For comparison, the earlier static `i mod N` placement gave 534 fps at
-`--npus 2` (imbalanced: one NPU got both slow-decode streams) and only
-reached 566 after the videos were *hand-reordered* into slow+fast pairs.
-Work-stealing hits 614 with no reordering — the placement problem disappears.
+The headline: **`--npus 1 --decoders 4` (1035 fps) ≈ `--npus 4 --decoders 4`
+(1039 fps)** — one NPU fed by four decoders matches four NPUs, because decode,
+not inference, was the wall. At `--npus 1 --decoders 1` the NPU runs at 11%
+util (decode is ~9× the work: 8.3 s vs 0.9 s over the run), exactly the 10×
+decode-dominates ratio the single-thread report predicted.
 
 Two lessons made measurable:
 
-1. **Work-stealing beats static placement for free** — under static `i mod N`,
-   wall time was gated by the slowest NPU and the operator had to reorder
-   streams to balance it (the stream-to-eFPGA SoC assignment problem). Pulling
-   from a shared queue removes that knob: `--npus 2` jumps 566 → 614 and the
-   two NPUs land at 100% / 99% utilization.
-2. **Imperfect scaling is shared-resource contention** — per-stream decode
-   latency still rises slightly with more threads (3.28 → 3.48 ms) because all
-   "NPUs" share one memory subsystem, exactly like chiplets sharing an
-   interconnect. At `--npus 4` there are only 4 streams for 4 NPUs, so a fast
-   NPU that finishes has nothing to steal until a stream is returned — the
-   util spread (69–100%) is this concurrency ceiling, not placement.
+1. **Pipelining alone doesn't beat the bottleneck — parallel decode does.**
+   Overlapping the 0.33 ms infer behind the 3.3 ms decode only hides the small
+   stage; the decode wall stays. The win comes from scaling the decode pool
+   independently of the NPU count, which the split makes possible. On a real
+   SoC the ultimate fix is a hardware video decoder block in front of the NPU.
+2. **Decode parallelism is capped by stream count, not thread count.** With 4
+   streams a stream is single-flight per stage, so at most 4 decode threads do
+   useful work (extra decoders idle); the decoder util spread (67–100%) is this
+   concurrency ceiling plus per-stream content asymmetry, not a scheduling bug.
+   All threads also share one memory subsystem, so per-stream decode latency
+   rises slightly under load — exactly like chiplets sharing an interconnect.
 
 Per-class thresholds are an *application policy*: the SDK decodes at the
 minimum threshold (mechanism), then each detection must clear its own
@@ -167,22 +173,33 @@ cross-stream comparison is fair). See that directory's README for sources.
 
 ## Measured results (Apple Silicon Mac mini, Release build)
 
-4 streams × 1080p30 × 720 frames each (2,880 frames total), single thread,
-round-robin scheduling, shared TinyDetector:
+4 streams × 1080p30 × 720 frames each (2,880 frames total), the default
+`--npus 1 --decoders 1` (one decode thread ⇄ one NPU thread):
 
 ```
 ══════════════════════════════════════════════════════════════════════════
- adas-multistream report — 4 streams, 8.9 s wall, 2880 frames total
- aggregate throughput: 325.0 fps (all streams combined)
+ adas-multistream report — 4 streams, 1 decoders, 1 NPUs, 8.4 s wall, 2880 frames total
+ aggregate throughput: 343.6 fps (all streams combined)
 ══════════════════════════════════════════════════════════════════════════
- stream          frames       fps │ decode ms (avg/p95/p99)   │ infer ms (avg/p95/p99)
+ stream          frames       fps │ decode ms (avg/p95/p99)   │ infer ms (avg/p95/p99)    │ det/frame raw→conf
 ────────────────────────────────────────────────────────────────────────────
- drive_front        720     81.2  │    3.33 /   4.57 /   5.25 │    0.36 /   0.35 /   0.42
- drive_rear         720     81.2  │    2.18 /   2.72 /   3.26 │    0.32 /   0.34 /   0.40
- drive_left         720     81.2  │    2.66 /   3.80 /   4.44 │    0.32 /   0.35 /   0.41
- drive_right        720     81.2  │    2.78 /   4.29 /   4.91 │    0.32 /   0.35 /   0.40
+ drive_front        720     85.9  │    3.38 /   4.72 /   5.44 │    0.32 /   0.36 /   0.49 │   0.0 →   0.0
+ drive_rear         720     85.9  │    2.22 /   2.82 /   3.58 │    0.33 /   0.38 /   0.64 │   0.0 →   0.0
+ drive_left         720     85.9  │    3.27 /   4.82 /   5.47 │    0.32 /   0.36 /   0.49 │   0.0 →   0.0
+ drive_right        720     85.9  │    2.76 /   4.31 /   4.70 │    0.31 /   0.32 /   0.35 │   0.0 →   0.0
+──────────────────────────────────────────────────────────────────────────
+ dec       frames      busy ms    util%
+ 0           2880       8375.9    99.9
+──────────────────────────────────────────────────────────────────────────
+ npu       frames      busy ms    util%
+ 0           2880        930.8    11.1
 ══════════════════════════════════════════════════════════════════════════
 ```
+
+The `util%` columns already tell the story: even with one decoder and one
+NPU, the decode thread is pinned at 100% while the NPU sits at 11% — decode
+is ~9× the work. Adding decode threads (`--decoders 4`) is what scales
+throughput; see the pipeline section above.
 
 Key observations:
 
@@ -202,7 +219,8 @@ Key observations:
   weights — boxes are not meaningful, but the runtime load is identical.
   With a trained `.vpnw` (see above) the same binary detects real
   vehicles/people.
-- Scheduling is dynamic work-stealing: N NPU threads pull streams from a
-  shared `StreamScheduler` (see `--npus N` above). Planned extensions:
-  priority scheduling (front camera first), frame dropping under
-  overload, and routing each NPU's frames through one `CommandQueue`.
+- Scheduling is a two-stage work-stealing pipeline: `--decoders M` decode
+  threads and `--npus N` NPU threads steal streams from a shared `Pipeline`
+  (see above). Planned extensions: priority scheduling (front camera first),
+  frame dropping under overload, and routing each NPU's frames through one
+  `CommandQueue`.

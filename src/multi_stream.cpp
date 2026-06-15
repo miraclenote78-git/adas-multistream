@@ -11,12 +11,15 @@
 //   drive_right.mp4 ─► VideoFileSource ─► preprocess ─┘     │
 //                                                  decode → NMS → stats
 //
-// Scheduling: dynamic work-stealing. Every stream is placed in one shared
-// queue; each NPU repeatedly pulls the next ready stream, runs one frame,
-// and returns it to the back of the queue. A stream is never bound to a
-// fixed NPU, so a fast NPU simply processes more frames than a slow one and
-// the load balances itself. Per-stream decode and inference latency are
-// recorded separately so the report shows where time actually goes.
+// Scheduling: a two-stage work-stealing pipeline. Decode (slow, ~3.3 ms of
+// H.264 software decode) and inference (fast, ~0.33 ms on the NPU) run in
+// separate thread pools — `--decoders M` decode threads feed `--npus N` NPU
+// threads through a bounded per-stream buffer — so the two stages overlap
+// instead of running back-to-back on one thread. Each stage steals work
+// independently; within a stage a stream is single-flight, so its stateful
+// decoder and temporal filter stay safe and frames stay in order. Per-stream
+// decode and inference latency are recorded separately so the report shows
+// where time actually goes.
 //
 // Usage:
 //   multi_stream <out_dir> <video1> [video2 ...]
@@ -62,6 +65,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -89,9 +93,32 @@ const std::vector<std::string> kClassNames = {
     "person", "bicycle", "car", "motorcycle", "bus", "truck",
 };
 
+// One decoded + preprocessed frame, handed from a decode thread to an NPU
+// thread. The frame data is *copied out* of the source's FrameView (which is
+// non-owning and only valid until the next decode) so the decoder can race
+// ahead while the NPU is still inferring an earlier frame. Preprocessing
+// (resize → NCHW fp32) runs in the decode stage, so only the small input
+// tensor crosses threads — never the full 1080p frame, except on the rare
+// snapshot frame which also carries an original-resolution copy to annotate.
+struct PipeFrame {
+    std::vector<float> input;            // NCHW fp32, ready for forward()
+    std::int64_t       frame_idx{0};     // = frames_decoded at decode time
+    double             decode_ms{0.0};   // measured in the decode stage
+
+    bool                      want_snapshot{false};
+    std::vector<std::uint8_t> full_rgb;  // original frame, snapshot only
+    int                       full_w{0}, full_h{0}, full_stride{0};
+};
+
 // Everything one camera stream owns. The arenas are deliberately
 // per-stream: on a real SoC this is the partitioning that stops one
 // camera's traffic from fragmenting another's memory.
+//
+// A stream flows decode → buffer → infer. The decode side touches `source`
+// and `small_rgb`; the infer side touches `scratch`, `output`, `filter`,
+// `stats`. Those sets are disjoint, so a decode thread and an NPU thread may
+// work the *same* stream at once (frame N+1 decoding while frame N infers).
+// The only shared field is `buffer`, owned by the Pipeline's lock.
 struct StreamCtx {
     StreamCtx(const std::string& path, std::size_t scratch_bytes,
               std::int64_t head_ch, int temporal_hits)
@@ -101,10 +128,6 @@ struct StreamCtx {
           stats(fs::path(path).stem().string()),
           filter(temporal_hits, /*max_misses=*/2, /*iou_match=*/0.3f),
           small_rgb(static_cast<std::size_t>(kInW * kInH * 3)) {
-        auto* in_buf = io_arena.allocate(
-            static_cast<std::size_t>(3 * kInH * kInW) * sizeof(float),
-            alignof(std::max_align_t));
-        input = runtime::make_tensor(in_buf, {1, 3, kInH, kInW}, runtime::DType::kFloat32);
         auto* out_buf = io_arena.allocate(
             static_cast<std::size_t>(head_ch * kGH * kGW) * sizeof(float),
             alignof(std::max_align_t));
@@ -116,71 +139,127 @@ struct StreamCtx {
     runtime::ArenaAllocator    scratch;
     adas::StreamStats          stats;
     adas::TemporalFilter       filter;
-    std::vector<std::uint8_t>  small_rgb;
-    std::vector<std::uint8_t>  annotated;
-    runtime::Tensor            input{};
+    std::vector<std::uint8_t>  small_rgb;     // decode-stage scratch
     runtime::Tensor            output{};
-    std::int64_t               frames_done{0};
+    std::int64_t               frames_decoded{0};   // decode side only
+    std::int64_t               frames_done{0};      // infer side only
+
+    // --- Pipeline scheduling state, guarded by Pipeline::mu_ ---
+    std::deque<PipeFrame> buffer;        // decoded, waiting for an NPU
+    bool decoding{false};                // a decode thread holds it now
+    bool inferring{false};               // an NPU thread holds it now
+    bool decode_done{false};             // EOF or frame cap reached
+    bool retired{false};                 // fully drained, counted out
 };
 
-// Per-NPU (worker) accounting. Each slot is written by exactly one worker
-// thread and read back only after join, so no locking is needed.
+// Per-thread accounting (decode pool and NPU pool alike). Each slot is
+// written by exactly one thread and read back only after join — no locking.
 struct WorkerStat {
-    std::int64_t frames  = 0;     // frames this NPU actually processed
-    double       busy_ms = 0.0;   // wall time it spent decoding + inferring
+    std::int64_t frames  = 0;     // frames this thread handled
+    double       busy_ms = 0.0;   // wall time it spent doing real work
 };
 
-// Dynamic stream scheduler — the work-stealing replacement for static
-// `stream i → NPU i % N` placement. The unit of work is a *stream*, not a
-// frame: each stream is stateful (decoder position, temporal tracks) and must
-// never be touched by two NPUs at once. Any idle NPU pulls the next ready
-// stream, runs one frame, and returns it to the back of the queue; a stream
-// that hits EOF is retired instead. A fast NPU therefore drains more frames
-// than a slow one — the load balances itself with nothing pinned to one NPU.
-// The internal mutex also publishes one worker's writes to a StreamCtx before
-// the next worker that picks it up can observe them.
-class StreamScheduler {
+// Two-stage work-stealing pipeline. Decode (slow, CPU/HW-decoder-modelled)
+// and inference (fast, NPU) run in separate thread pools so they overlap;
+// a bounded per-stream buffer lets the decoder run ahead without unbounded
+// memory or losing frame order. Each stage independently steals work:
+//
+//   decode-eligible: not finished, not already decoding, buffer has room
+//   infer-eligible : buffer non-empty, not already inferring
+//
+// Per stage a stream is single-flight (the flags), so the stateful decoder
+// and temporal filter are never touched concurrently and frames stay in
+// order; across stages the same stream may decode and infer at once. The
+// shared mutex also publishes one thread's writes before another observes
+// them. Streams are few, so eligibility is found by a short linear scan
+// rather than maintaining separate ready-queues.
+class Pipeline {
 public:
-    explicit StreamScheduler(const std::vector<StreamCtx*>& initial)
-        : ready_(initial.begin(), initial.end()),
-          remaining_(initial.size()) {}
+    Pipeline(std::vector<StreamCtx*> streams, std::size_t buf_cap,
+             std::int64_t max_frames)
+        : streams_(std::move(streams)), cap_(buf_cap),
+          max_frames_(max_frames), active_(streams_.size()) {}
 
-    // Pop the next ready stream. Blocks while the queue is momentarily empty
-    // but streams are still in flight; returns nullptr once every stream has
-    // been retired — the signal for a worker to exit.
-    StreamCtx* take() {
+    // Claim a stream to decode one frame into, or nullptr when all done.
+    StreamCtx* acquire_decode() {
         std::unique_lock<std::mutex> lk(mu_);
-        cv_.wait(lk, [&] { return !ready_.empty() || remaining_ == 0; });
-        if (ready_.empty()) return nullptr;
-        StreamCtx* s = ready_.front();
-        ready_.pop_front();
-        return s;
-    }
-
-    // Return a stream that still has frames left, for any worker to pick up.
-    void put_back(StreamCtx* s) {
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            ready_.push_back(s);
+        for (;;) {
+            for (auto* s : streams_) {
+                if (decode_eligible(*s)) { s->decoding = true; return s; }
+            }
+            if (active_ == 0) return nullptr;
+            cv_.wait(lk);
         }
-        cv_.notify_one();
     }
 
-    // Retire a finished stream (EOF / frame cap). When the last one finishes,
-    // wake every worker so blocked ones see remaining_ == 0 and exit.
-    void retire() {
+    // Hand back a decoded frame (nullopt = the decode just hit EOF).
+    void complete_decode(StreamCtx* s, std::optional<PipeFrame> pf) {
         {
             std::lock_guard<std::mutex> lk(mu_);
-            --remaining_;
+            s->decoding = false;
+            if (pf) {
+                s->buffer.push_back(std::move(*pf));
+                ++s->frames_decoded;
+                if (max_frames_ >= 0 && s->frames_decoded >= max_frames_)
+                    s->decode_done = true;
+            } else {
+                s->decode_done = true;
+            }
+            maybe_retire(*s);
+        }
+        cv_.notify_all();
+    }
+
+    // Claim a stream's oldest decoded frame, or nullopt when all done.
+    std::optional<std::pair<StreamCtx*, PipeFrame>> acquire_infer() {
+        std::unique_lock<std::mutex> lk(mu_);
+        for (;;) {
+            for (auto* s : streams_) {
+                if (infer_eligible(*s)) {
+                    s->inferring = true;
+                    PipeFrame pf = std::move(s->buffer.front());
+                    s->buffer.pop_front();
+                    lk.unlock();
+                    cv_.notify_all();   // freed a buffer slot → decode may resume
+                    return std::make_pair(s, std::move(pf));
+                }
+            }
+            if (active_ == 0) return std::nullopt;
+            cv_.wait(lk);
+        }
+    }
+
+    void complete_infer(StreamCtx* s) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            s->inferring = false;
+            ++s->frames_done;
+            maybe_retire(*s);
         }
         cv_.notify_all();
     }
 
 private:
+    bool decode_eligible(const StreamCtx& s) const {
+        return !s.decoding && !s.decode_done && s.buffer.size() < cap_;
+    }
+    bool infer_eligible(const StreamCtx& s) const {
+        return !s.inferring && !s.buffer.empty();
+    }
+    void maybe_retire(StreamCtx& s) {
+        if (!s.retired && s.decode_done && s.buffer.empty() &&
+            !s.decoding && !s.inferring) {
+            s.retired = true;
+            --active_;
+        }
+    }
+
     std::mutex              mu_;
     std::condition_variable cv_;
-    std::deque<StreamCtx*>  ready_;
-    std::size_t             remaining_;
+    std::vector<StreamCtx*> streams_;
+    std::size_t             cap_;
+    std::int64_t            max_frames_;
+    std::size_t             active_;
 };
 
 // BLIP-caption-style bottom bar: black band + one line of scene summary,
@@ -222,16 +301,33 @@ void draw_analysis_bar(std::uint8_t* buf, int width, int height, int stride,
                        255, 255, 255, scale);
 }
 
+// One per-thread utilization block (used for the decode pool and the NPU
+// pool). util% = time spent doing real work / wall time.
+void print_pool(const char* label, const std::vector<WorkerStat>& pool,
+                double wall_s) {
+    std::printf("──────────────────────────────────────────────────────────────────────────\n");
+    std::printf(" %-6s %9s %12s %8s\n", label, "frames", "busy ms", "util%");
+    for (std::size_t n = 0; n < pool.size(); ++n) {
+        const double util = wall_s > 0.0
+            ? 100.0 * pool[n].busy_ms / (wall_s * 1000.0) : 0.0;
+        std::printf(" %-6zu %9lld %12.1f %7.1f\n",
+                    n, static_cast<long long>(pool[n].frames),
+                    pool[n].busy_ms, util);
+    }
+}
+
 void print_report(const std::vector<std::unique_ptr<StreamCtx>>& streams,
-                  const std::vector<WorkerStat>& workers,
+                  const std::vector<WorkerStat>& decoders,
+                  const std::vector<WorkerStat>& npus,
                   double wall_s) {
     std::int64_t total_frames = 0;
     for (const auto& s : streams) total_frames += s->frames_done;
 
     std::printf("\n");
     std::printf("══════════════════════════════════════════════════════════════════════════\n");
-    std::printf(" adas-multistream report — %zu streams, %zu NPUs, %.1f s wall, %lld frames total\n",
-                streams.size(), workers.size(), wall_s,
+    std::printf(" adas-multistream report — %zu streams, %zu decoders, %zu NPUs, "
+                "%.1f s wall, %lld frames total\n",
+                streams.size(), decoders.size(), npus.size(), wall_s,
                 static_cast<long long>(total_frames));
     std::printf(" aggregate throughput: %.1f fps (all streams combined)\n",
                 static_cast<double>(total_frames) / wall_s);
@@ -252,22 +348,12 @@ void print_report(const std::vector<std::unique_ptr<StreamCtx>>& streams,
                     s->stats.avg_raw(), s->stats.avg_confirmed());
     }
 
-    // Per-NPU work-stealing balance. Under static placement these frame
-    // counts were fixed by the stream→NPU map (and idle time on the fast NPU
-    // was invisible); with work-stealing a faster NPU grabs more, so the
-    // columns show how evenly the load actually spread and how busy each
-    // NPU stayed (util% = busy / wall).
-    if (workers.size() > 1) {
-        std::printf("──────────────────────────────────────────────────────────────────────────\n");
-        std::printf(" %-6s %9s %12s %8s\n", "npu", "frames", "busy ms", "util%");
-        for (std::size_t n = 0; n < workers.size(); ++n) {
-            const double util = wall_s > 0.0
-                ? 100.0 * workers[n].busy_ms / (wall_s * 1000.0) : 0.0;
-            std::printf(" %-6zu %9lld %12.1f %7.1f\n",
-                        n, static_cast<long long>(workers[n].frames),
-                        workers[n].busy_ms, util);
-        }
-    }
+    // Per-pool work-stealing balance. The decode pool is the bottleneck
+    // (each decoder ~3.3 ms/frame); the NPU pool is cheap (~0.33 ms) and
+    // should sit at low util unless decoders outnumber NPUs — that gap is
+    // the whole point of splitting the stages.
+    print_pool("dec", decoders, wall_s);
+    print_pool("npu", npus, wall_s);
     std::printf("══════════════════════════════════════════════════════════════════════════\n");
 }
 
@@ -290,6 +376,7 @@ int main(int argc, char* argv[]) {
     std::int64_t snapshot_frame = 60;
     int          temporal_hits  = 0;
     int          num_npus       = 1;
+    int          num_decoders   = -1;   // -1 → default to num_npus
 
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -299,6 +386,7 @@ int main(int argc, char* argv[]) {
         else if (a == "--weights" && i + 1 < argc)   weights_path = argv[++i];
         else if (a == "--temporal" && i + 1 < argc)  temporal_hits = std::atoi(argv[++i]);
         else if (a == "--npus" && i + 1 < argc)      num_npus = std::atoi(argv[++i]);
+        else if (a == "--decoders" && i + 1 < argc)  num_decoders = std::atoi(argv[++i]);
         else if (a == "--cls" && i + 1 < argc) {
             const std::string kv = argv[++i];
             const auto eq = kv.find('=');
@@ -342,7 +430,9 @@ int main(int argc, char* argv[]) {
     model::TinyDetector& detector0 = *npus.front();
     const std::size_t scratch_bytes = detector0.recommended_scratch_bytes();
 
+    if (num_decoders < 1) num_decoders = num_npus;   // default: one per NPU
     std::printf("npus: %d (1 detector instance + 1 worker thread each)\n", num_npus);
+    std::printf("decoders: %d (separate decode pool feeding the NPUs)\n", num_decoders);
     if (detector0.num_classes() > 0) {
         std::printf("classes: %lld\n",
                     static_cast<long long>(detector0.num_classes()));
@@ -383,110 +473,126 @@ int main(int argc, char* argv[]) {
                     ctx->stats.name().c_str(), info.width, info.height, info.fps);
         streams.push_back(std::move(ctx));
     }
-    std::printf("scheduling: dynamic work-stealing across %d NPU%s\n",
+    std::printf("scheduling: decode/infer pipeline — %d decoder%s ⇄ %d NPU%s\n",
+                num_decoders, num_decoders == 1 ? "" : "s",
                 num_npus, num_npus == 1 ? "" : "s");
 
-    // --- Shared scheduler: every stream is eligible for any NPU ---
+    // --- The pipeline: decode pool and NPU pool steal from one coordinator ---
+    constexpr std::size_t kBufCap = 3;   // frames a decoder may run ahead per stream
     std::vector<StreamCtx*> all;
     all.reserve(streams.size());
     for (auto& sp : streams) all.push_back(sp.get());
-    StreamScheduler sched(all);
+    Pipeline pipe(all, kBufCap, max_frames);
 
     std::mutex io_mu;
-    std::vector<WorkerStat> worker_stats(static_cast<std::size_t>(num_npus));
+    std::vector<WorkerStat> decoder_stats(static_cast<std::size_t>(num_decoders));
+    std::vector<WorkerStat> npu_stats(static_cast<std::size_t>(num_npus));
 
-    // Run exactly one frame of stream `s` on NPU `npu_id`'s detector.
-    // Returns false when the stream has reached EOF or its frame cap, i.e.
-    // the caller should retire it instead of returning it to the queue.
-    auto process_one = [&](StreamCtx& s, model::TinyDetector& npu_det,
-                           int npu_id) -> bool {
-        if (max_frames >= 0 && s.frames_done >= max_frames) return false;
-
-        const auto t_dec = Clock::now();
-        auto frame = s.source.next_frame();
-        if (!frame) return false;
-        const double decode_ms = ms_since(t_dec);
-
-        const auto t_inf = Clock::now();
-        vision::resize_rgb24_nn(frame->data, frame->width, frame->height,
-                                frame->stride,
-                                s.small_rgb.data(), kInW, kInH, kInW * 3);
-        vision::rgb24_to_nchw_fp32(s.small_rgb.data(), kInW, kInH, kInW * 3,
-                                   s.input);
-        npu_det.forward(s.input, s.scratch, s.output);
-        auto dets = model::decode_tiny_detector_output(s.output, /*batch_index=*/0,
-                                                       kInW, kInH, decode_threshold);
-        // App policy: each class clears its own bar before NMS.
-        dets.erase(std::remove_if(dets.begin(), dets.end(),
-                       [&](const model::Detection& d) {
-                           const auto k = static_cast<std::size_t>(d.cls_id);
-                           return k < cls_threshold.size() &&
-                                  d.score < cls_threshold[k];
-                       }),
-                   dets.end());
-        dets = model::nms(std::move(dets), /*iou_threshold=*/0.45f);
-        const std::size_t raw_count = dets.size();
-        dets = s.filter.update(std::move(dets));
-        const double infer_ms = ms_since(t_inf);
-
-        s.stats.record_frame(decode_ms, infer_ms, raw_count, dets.size());
-
-        if (s.frames_done == snapshot_frame) {
-            const float sx = static_cast<float>(frame->width)  / static_cast<float>(kInW);
-            const float sy = static_cast<float>(frame->height) / static_cast<float>(kInH);
-            for (auto& d : dets) { d.cx *= sx; d.cy *= sy; d.w *= sx; d.h *= sy; }
-            const auto bytes = static_cast<std::size_t>(frame->stride) *
-                               static_cast<std::size_t>(frame->height);
-            s.annotated.assign(bytes, 0u);
-            std::memcpy(s.annotated.data(), frame->data, bytes);
-            vision::draw_detections_labeled(s.annotated.data(),
-                                            frame->width, frame->height,
-                                            frame->stride, dets, kClassNames,
-                                            /*thickness=*/3, /*label_scale=*/3);
-            draw_analysis_bar(s.annotated.data(),
-                              frame->width, frame->height, frame->stride,
-                              s.stats.name(), s.frames_done, dets, infer_ms);
-            const std::string path = out_dir + "/" + s.stats.name() + "_snapshot.ppm";
-            vision::write_ppm(path, s.annotated.data(),
-                              frame->width, frame->height, frame->stride);
-            std::lock_guard<std::mutex> lk(io_mu);
-            std::printf("  [npu%d:%s] snapshot @ frame %lld → %s (%zu dets)\n",
-                        npu_id, s.stats.name().c_str(),
-                        static_cast<long long>(s.frames_done),
-                        path.c_str(), dets.size());
-        }
-
-        ++s.frames_done;
-        return true;
-    };
-
-    // --- NPU worker: pull any ready stream, run one frame, return it ---
-    auto run_worker = [&](int npu_id) {
-        model::TinyDetector& npu_det = *npus[static_cast<std::size_t>(npu_id)];
-        WorkerStat& ws = worker_stats[static_cast<std::size_t>(npu_id)];
+    // Decode stage: decode one frame and preprocess it (resize → NCHW) so only
+    // the small input tensor — never the full 1080p frame — crosses to the NPU.
+    auto run_decoder = [&](int dec_id) {
+        WorkerStat& ws = decoder_stats[static_cast<std::size_t>(dec_id)];
         for (;;) {
-            StreamCtx* s = sched.take();
+            StreamCtx* s = pipe.acquire_decode();
             if (!s) break;                       // all streams retired → exit
+
             const auto t0 = Clock::now();
-            const bool more = process_one(*s, npu_det, npu_id);
-            ws.busy_ms += ms_since(t0);
-            if (more) {
+            auto frame = s->source.next_frame();
+            std::optional<PipeFrame> pf;
+            if (frame) {
+                PipeFrame f;
+                f.frame_idx = s->frames_decoded;
+                vision::resize_rgb24_nn(frame->data, frame->width, frame->height,
+                                        frame->stride,
+                                        s->small_rgb.data(), kInW, kInH, kInW * 3);
+                f.input.resize(static_cast<std::size_t>(3 * kInH * kInW));
+                runtime::Tensor in = runtime::make_tensor(
+                    f.input.data(), {1, 3, kInH, kInW}, runtime::DType::kFloat32);
+                vision::rgb24_to_nchw_fp32(s->small_rgb.data(), kInW, kInH,
+                                           kInW * 3, in);
+                if (f.frame_idx == snapshot_frame) {
+                    f.want_snapshot = true;
+                    f.full_w = frame->width; f.full_h = frame->height;
+                    f.full_stride = frame->stride;
+                    const auto bytes = static_cast<std::size_t>(frame->stride) *
+                                       static_cast<std::size_t>(frame->height);
+                    f.full_rgb.assign(frame->data, frame->data + bytes);
+                }
+                f.decode_ms = ms_since(t0);
+                pf = std::move(f);
                 ++ws.frames;
-                sched.put_back(s);
-            } else {
-                sched.retire();
             }
+            ws.busy_ms += ms_since(t0);
+            pipe.complete_decode(s, std::move(pf));
         }
     };
 
-    // --- Launch one thread per NPU; all share the stream scheduler ---
+    // Infer stage: run the NPU on one buffered frame, then post-process.
+    auto run_npu = [&](int npu_id) {
+        model::TinyDetector& npu_det = *npus[static_cast<std::size_t>(npu_id)];
+        WorkerStat& ws = npu_stats[static_cast<std::size_t>(npu_id)];
+        for (;;) {
+            auto job = pipe.acquire_infer();
+            if (!job) break;                     // all streams retired → exit
+            StreamCtx& s = *job->first;
+            PipeFrame& f = job->second;
+
+            const auto t0 = Clock::now();
+            runtime::Tensor in = runtime::make_tensor(
+                f.input.data(), {1, 3, kInH, kInW}, runtime::DType::kFloat32);
+            npu_det.forward(in, s.scratch, s.output);
+            auto dets = model::decode_tiny_detector_output(s.output, /*batch_index=*/0,
+                                                           kInW, kInH, decode_threshold);
+            // App policy: each class clears its own bar before NMS.
+            dets.erase(std::remove_if(dets.begin(), dets.end(),
+                           [&](const model::Detection& d) {
+                               const auto k = static_cast<std::size_t>(d.cls_id);
+                               return k < cls_threshold.size() &&
+                                      d.score < cls_threshold[k];
+                           }),
+                       dets.end());
+            dets = model::nms(std::move(dets), /*iou_threshold=*/0.45f);
+            const std::size_t raw_count = dets.size();
+            dets = s.filter.update(std::move(dets));
+            const double infer_ms = ms_since(t0);
+
+            s.stats.record_frame(f.decode_ms, infer_ms, raw_count, dets.size());
+
+            if (f.want_snapshot) {
+                const float sx = static_cast<float>(f.full_w) / static_cast<float>(kInW);
+                const float sy = static_cast<float>(f.full_h) / static_cast<float>(kInH);
+                for (auto& d : dets) { d.cx *= sx; d.cy *= sy; d.w *= sx; d.h *= sy; }
+                vision::draw_detections_labeled(f.full_rgb.data(),
+                                                f.full_w, f.full_h, f.full_stride,
+                                                dets, kClassNames,
+                                                /*thickness=*/3, /*label_scale=*/3);
+                draw_analysis_bar(f.full_rgb.data(), f.full_w, f.full_h, f.full_stride,
+                                  s.stats.name(), f.frame_idx, dets, infer_ms);
+                const std::string path = out_dir + "/" + s.stats.name() + "_snapshot.ppm";
+                vision::write_ppm(path, f.full_rgb.data(),
+                                  f.full_w, f.full_h, f.full_stride);
+                std::lock_guard<std::mutex> lk(io_mu);
+                std::printf("  [npu%d:%s] snapshot @ frame %lld → %s (%zu dets)\n",
+                            npu_id, s.stats.name().c_str(),
+                            static_cast<long long>(f.frame_idx),
+                            path.c_str(), dets.size());
+            }
+
+            ws.busy_ms += ms_since(t0);
+            ++ws.frames;
+            pipe.complete_infer(&s);
+        }
+    };
+
+    // --- Launch both pools; they overlap through the shared Pipeline ---
     const auto t_start = Clock::now();
-    std::vector<std::thread> workers;
-    workers.reserve(static_cast<std::size_t>(num_npus));
-    for (int n = 0; n < num_npus; ++n) workers.emplace_back(run_worker, n);
-    for (auto& w : workers) w.join();
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(num_decoders + num_npus));
+    for (int n = 0; n < num_decoders; ++n) threads.emplace_back(run_decoder, n);
+    for (int n = 0; n < num_npus; ++n)     threads.emplace_back(run_npu, n);
+    for (auto& t : threads) t.join();
     const double wall_s = ms_since(t_start) / 1000.0;
 
-    print_report(streams, worker_stats, wall_s);
+    print_report(streams, decoder_stats, npu_stats, wall_s);
     return 0;
 }
