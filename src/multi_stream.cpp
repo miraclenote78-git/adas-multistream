@@ -110,6 +110,36 @@ struct PipeFrame {
     int                       full_w{0}, full_h{0}, full_stride{0};
 };
 
+// Free-list of input buffers shared by all threads. Every PipeFrame.input is
+// the same size (3·kInH·kInW floats), so a decoder borrows one instead of
+// heap-allocating per frame and the NPU returns it after inference. Same idea
+// as a framebuffer cache: pool the per-frame scratch, pay the malloc
+// once. The free list self-sizes to the number of frames in flight, then
+// stops growing.
+class BufferPool {
+public:
+    std::vector<float> acquire(std::size_t n) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (!free_.empty()) {
+                std::vector<float> buf = std::move(free_.back());
+                free_.pop_back();
+                buf.resize(n);     // no realloc once capacity is reached
+                return buf;
+            }
+        }
+        return std::vector<float>(n);
+    }
+    void release(std::vector<float>&& buf) {
+        std::lock_guard<std::mutex> lk(mu_);
+        free_.push_back(std::move(buf));
+    }
+
+private:
+    std::mutex                      mu_;
+    std::vector<std::vector<float>> free_;
+};
+
 // Everything one camera stream owns. The arenas are deliberately
 // per-stream: on a real SoC this is the partitioning that stops one
 // camera's traffic from fragmenting another's memory.
@@ -485,6 +515,7 @@ int main(int argc, char* argv[]) {
     Pipeline pipe(all, kBufCap, max_frames);
 
     std::mutex io_mu;
+    BufferPool input_pool;   // reused NCHW input buffers (no per-frame malloc)
     std::vector<WorkerStat> decoder_stats(static_cast<std::size_t>(num_decoders));
     std::vector<WorkerStat> npu_stats(static_cast<std::size_t>(num_npus));
 
@@ -505,7 +536,7 @@ int main(int argc, char* argv[]) {
                 vision::resize_rgb24_nn(frame->data, frame->width, frame->height,
                                         frame->stride,
                                         s->small_rgb.data(), kInW, kInH, kInW * 3);
-                f.input.resize(static_cast<std::size_t>(3 * kInH * kInW));
+                f.input = input_pool.acquire(static_cast<std::size_t>(3 * kInH * kInW));
                 runtime::Tensor in = runtime::make_tensor(
                     f.input.data(), {1, 3, kInH, kInW}, runtime::DType::kFloat32);
                 vision::rgb24_to_nchw_fp32(s->small_rgb.data(), kInW, kInH,
@@ -578,6 +609,7 @@ int main(int argc, char* argv[]) {
                             path.c_str(), dets.size());
             }
 
+            input_pool.release(std::move(f.input));   // back to the pool for reuse
             ws.busy_ms += ms_since(t0);
             ++ws.frames;
             pipe.complete_infer(&s);
