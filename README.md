@@ -59,30 +59,41 @@ Options:
 ### Multi-NPU simulation (`--npus N`)
 
 One NPU = one detector instance (its own weight copy, modeling the NPU's
-private SRAM) + one worker thread (independent compute). Streams are
-placed statically: stream *i* → NPU *i mod N* — so the CLI order of the
-videos **is** the placement policy.
+private SRAM) + one worker thread (independent compute). Streams are **not**
+pinned to an NPU: they all sit in one shared scheduler and each NPU pulls the
+next ready stream, runs one frame, and returns it to the back of the queue
+(`StreamScheduler` in `src/multi_stream.cpp`). A stream is the unit of work —
+never a single frame — because each stream is stateful (decoder position,
+temporal tracks) and must never be touched by two NPUs at once. A faster NPU
+simply drains more frames, so the load balances itself with no hand-tuned
+placement. The report's per-NPU `frames` / `util%` columns show the result.
 
 Measured (same 4 videos, trained weights, temporal 2, no snapshots):
 
-| config | aggregate fps | scaling | note |
+| config | aggregate fps | scaling | per-NPU balance |
 |---|---|---|---|
-| `--npus 1` | 313 | 1.00× | baseline |
-| `--npus 2` (default order) | 534 | 1.71× | npu0 got both slow-decode streams (front+left) — imbalance |
-| `--npus 2` (reordered: slow+fast pairs) | **566** | 1.81× | +6% from placement alone |
-| `--npus 4` | 1013 | 3.23× | one stream per NPU |
+| `--npus 1` | 318 | 1.00× | baseline |
+| `--npus 2` | **614** | 1.93× | frames 1446/1434, util 100%/99% — even |
+| `--npus 4` | 1042 | 3.28× | frames 615…823, capped by 4-stream concurrency |
+
+For comparison, the earlier static `i mod N` placement gave 534 fps at
+`--npus 2` (imbalanced: one NPU got both slow-decode streams) and only
+reached 566 after the videos were *hand-reordered* into slow+fast pairs.
+Work-stealing hits 614 with no reordering — the placement problem disappears.
 
 Two lessons made measurable:
 
-1. **Scale-out works but placement decides the yield** — wall time is
-   gated by the slowest NPU, so pairing the two slowest streams on one
-   NPU wastes the other's idle time. On a real chiplet system this is
-   the stream-to-eFPGA SoC assignment problem.
-2. **Imperfect scaling is shared-resource contention** — per-stream
-   decode latency rises slightly with more threads (3.33 → 3.47 ms)
-   because all "NPUs" share one memory subsystem, exactly like chiplets
-   sharing an interconnect. Dynamic placement / work stealing is the
-   natural next step.
+1. **Work-stealing beats static placement for free** — under static `i mod N`,
+   wall time was gated by the slowest NPU and the operator had to reorder
+   streams to balance it (the stream-to-eFPGA SoC assignment problem). Pulling
+   from a shared queue removes that knob: `--npus 2` jumps 566 → 614 and the
+   two NPUs land at 100% / 99% utilization.
+2. **Imperfect scaling is shared-resource contention** — per-stream decode
+   latency still rises slightly with more threads (3.28 → 3.48 ms) because all
+   "NPUs" share one memory subsystem, exactly like chiplets sharing an
+   interconnect. At `--npus 4` there are only 4 streams for 4 NPUs, so a fast
+   NPU that finishes has nothing to steal until a stream is returned — the
+   util spread (69–100%) is this concurrency ceiling, not placement.
 
 Per-class thresholds are an *application policy*: the SDK decodes at the
 minimum threshold (mechanism), then each detection must clear its own
@@ -191,6 +202,7 @@ Key observations:
   weights — boxes are not meaningful, but the runtime load is identical.
   With a trained `.vpnw` (see above) the same binary detects real
   vehicles/people.
-- Scheduling is round-robin in a single thread. Planned extensions:
+- Scheduling is dynamic work-stealing: N NPU threads pull streams from a
+  shared `StreamScheduler` (see `--npus N` above). Planned extensions:
   priority scheduling (front camera first), frame dropping under
-  overload, and a worker-thread pool feeding one `CommandQueue`.
+  overload, and routing each NPU's frames through one `CommandQueue`.
