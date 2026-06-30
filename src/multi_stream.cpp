@@ -405,7 +405,7 @@ int main(int argc, char* argv[]) {
     float        threshold      = 0.5f;
     std::int64_t snapshot_frame = 60;
     int          temporal_hits  = 0;
-    int          num_npus       = 1;
+    int          num_npus       = -1;   // -1 → auto: one NPU per stream (capped at cores)
     int          num_decoders   = -1;   // -1 → default to num_npus
 
     for (int i = 2; i < argc; ++i) {
@@ -438,7 +438,16 @@ int main(int argc, char* argv[]) {
     // --- Simulated NPUs ---
     // One NPU = one detector instance (its own weight copy, modeling the
     // NPU's private SRAM) + one worker thread (independent compute).
-    if (num_npus < 1) num_npus = 1;
+    // Default (--npus omitted, num_npus < 1) is auto: one NPU per stream —
+    // the natural "one accelerator per camera" mapping — capped at the core
+    // count so a large stream set doesn't spawn more threads than cores.
+    if (num_npus < 1) {
+        num_npus = static_cast<int>(videos.size());
+        const unsigned cores = std::thread::hardware_concurrency();
+        if (cores > 0 && num_npus > static_cast<int>(cores))
+            num_npus = static_cast<int>(cores);
+        if (num_npus < 1) num_npus = 1;
+    }
     std::vector<std::unique_ptr<runtime::ArenaAllocator>> npu_weight_arenas;
     std::vector<std::unique_ptr<model::TinyDetector>> npus;
     {

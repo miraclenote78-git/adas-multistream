@@ -54,7 +54,7 @@ Options:
 | `--snapshot N` | write annotated PPM per stream at frame N (-1 = off) | 60 |
 | `--weights F.vpnw` | load trained weights | synthesized (untrained) |
 | `--temporal N` | confirm detections only after N consecutive matched frames (0 = off) | 0 |
-| `--npus N` | number of NPU (inference) threads, each its own detector instance | 1 |
+| `--npus N` | number of NPU (inference) threads, each its own detector instance | auto: one per stream (capped at cores) |
 | `--decoders N` | number of decode threads feeding the NPUs | = `--npus` |
 
 ### Decode/infer pipeline (`--npus N`, `--decoders M`)
@@ -173,8 +173,10 @@ cross-stream comparison is fair). See that directory's README for sources.
 
 ## Measured results (Apple Silicon Mac mini, Release build)
 
-4 streams × 1080p30 × 720 frames each (2,880 frames total), the default
-`--npus 1 --decoders 1` (one decode thread ⇄ one NPU thread):
+4 streams × 1080p30 × 720 frames each (2,880 frames total), the
+`--npus 1 --decoders 1` baseline (one decode thread ⇄ one NPU thread; the
+default auto-picks one NPU per stream — 4 here — shown in the pipeline
+section above):
 
 ```
 ══════════════════════════════════════════════════════════════════════════
