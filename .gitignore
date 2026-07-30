@@ -17,3 +17,7 @@ output/
 
 # OS
 .DS_Store
+
+# README 외 마크다운 문서는 추적 제외
+*.md
+!README.md
